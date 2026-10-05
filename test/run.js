@@ -19,6 +19,7 @@ const injected = [];
 const submitted = [];   // args passed to lcSubmitInPage
 const notifications = [];
 let lcLoggedIn = true;
+let solvedSlugs = null;   // null: progress query unavailable; array: SOLVED slugs
 let verdict = 'Accepted';
 let ncVerdict = 'Accepted';
 let nextSubmissionId = 100;
@@ -36,7 +37,8 @@ global.fetch = async (url, init) => {
   if (String(url).endsWith('data/mapping.json')) return { ok: true, json: async () => mapping };
   if (String(url).includes('leetcode.com/api/problems/all/')) {
     return { ok: true, json: async () => ({ user_name: lcLoggedIn ? 'tester' : '', num_solved: 3, stat_status_pairs: [
-      { stat: { question__title: 'Two Sum', question__title_slug: 'two-sum', frontend_question_id: 1, question_id: 1 }, paid_only: false, status: 'ac' },
+      { stat: { question__title: 'Two Sum', question__title_slug: 'two-sum', frontend_question_id: 1, question_id: 1 }, paid_only: false, status: 'AC' },
+      { stat: { question__title: 'Valid Anagram', question__title_slug: 'valid-anagram', frontend_question_id: 242, question_id: 242 }, paid_only: false, status: null },
       { stat: { question__title: 'Walls and Gates', question__title_slug: 'walls-and-gates', frontend_question_id: 286, question_id: 286 }, paid_only: true, status: null },
       { stat: { question__title: 'Brand New Problem', question__title_slug: 'brand-new-problem', frontend_question_id: 9999, question_id: 12345 }, paid_only: false, status: null },
     ] }) };
@@ -87,6 +89,7 @@ global.chrome = {
         return [{ result: { done: true, ok: true, statusMsg: verdict, totalCorrect: 10, totalTestcases: 10, runtime: '40 ms' } }];
       }
       if (func.name === 'lcFetchAllInPage') return [{ result: { ok: false } }];
+      if (func.name === 'lcSolvedSlugsInPage') return [{ result: solvedSlugs ? { ok: true, slugs: solvedSlugs, total: solvedSlugs.length } : { ok: false } }];
       if (func.name === 'lcSnippetInPage') return [{ result: { ok: true, code: args[0].slug === 'brand-new-problem' ? LC_SNIPPET : null } }];
       throw new Error('unknown injected function ' + func.name);
     },
@@ -234,7 +237,7 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   assert.strictEqual(ncSubmit.msg.lang, 'python');
   assert.ok(ncSubmit.msg.code.includes('def hasDuplicate(') && !ncSubmit.msg.code.includes('containsDuplicate'), ncSubmit.msg.code);
   const ncMark = sentToTabs.find((s) => s.msg.type === 'N2L_NC_MARK');
-  assert.deepStrictEqual({ topic: ncMark.msg.topic, link: ncMark.msg.link }, { topic: 'Arrays & Hashing', link: 'contains-duplicate/' });
+  assert.deepStrictEqual({ topic: ncMark.msg.topic, link: ncMark.msg.link }, { topic: 'Arrays & Hashing', link: 'https://leetcode.com/problems/contains-duplicate/' });
   st = await send({ type: 'getState' });
   assert.strictEqual(st.queueCount, 0);
   assert.strictEqual(st.log[0].status, 'Accepted');
@@ -258,7 +261,7 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   assert.strictEqual(r.queued, true, JSON.stringify(r));
   await settle();
   assert.ok(!sentToTabs.some((s) => s.msg.type === 'N2L_NC_SUBMIT'));
-  assert.ok(sentToTabs.some((s) => s.msg.type === 'N2L_NC_MARK' && s.msg.link === 'valid-anagram/'));
+  assert.ok(sentToTabs.some((s) => s.msg.type === 'N2L_NC_MARK' && s.msg.link === 'https://leetcode.com/problems/valid-anagram/'));
   r = await send({ type: 'N2L_LC_ACCEPTED', source: 'live', slug: 'not-on-neetcode-at-all', lang: 'cpp', code: 'x' });
   assert.strictEqual(r.level, 'silent', JSON.stringify(r));
 
@@ -267,16 +270,17 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   r = await send({ type: 'N2L_LC_ACCEPTED', source: 'live', slug: 'valid-anagram', lang: 'cpp', code: 'y' });
   assert.strictEqual(r.level, 'silent', JSON.stringify(r));
 
-  // 17. reverse bulk (mark): accepted on LeetCode, not yet ticked on NeetCode -> queued; already ticked -> skipped
+  // 17. reverse bulk (mark): "AC" counts, and a null legacy status still counts when the progress
+  // query lists the slug. Already ticked on NeetCode is skipped.
   await send({ type: 'setSettings', settings: { lc2nc: 'mark' } });
   await send({ type: 'clearLog' });
+  solvedSlugs = ['valid-anagram'];
   await send({ type: 'startReverseBulk', options: { dryRun: true } });
   await settle();
   st = await send({ type: 'getState' });
   assert.strictEqual(st.bulk.direction, 'lc2nc');
   assert.strictEqual(st.bulk.phase, 'done');
-  // the fake LeetCode list has only two-sum as 'ac', and NeetCode already has it ticked -> nothing to do
-  assert.strictEqual(st.bulk.found, 0, JSON.stringify(st.bulk));
+  assert.strictEqual(st.bulk.found, 1, JSON.stringify(st.bulk));
 
   console.log('all background tests passed');
   process.exit(0);

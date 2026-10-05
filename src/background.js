@@ -206,6 +206,12 @@ async function fetchLcAll() {
   return j;
 }
 
+// Legacy /api/problems/all/ uses "ac". The current problemset and progress APIs use "AC" / "SOLVED".
+function lcAcceptedStatus(status) {
+  const s = String(status == null ? '' : status).toLowerCase();
+  return s === 'ac' || s === 'solved';
+}
+
 async function getLcIndex(force = false) {
   if (!force && lcIndexCache && Date.now() - lcIndexCache.at < 10 * 60_000) return lcIndexCache;
   const j = await fetchLcAll();
@@ -213,8 +219,24 @@ async function getLcIndex(force = false) {
   for (const x of j.stat_status_pairs || []) {
     const s = x.stat;
     const e = { slug: s.question__title_slug, num: s.frontend_question_id, questionId: s.question_id,
-      premium: !!x.paid_only, title: s.question__title, status: x.status };
+      premium: !!x.paid_only, title: s.question__title, status: lcAcceptedStatus(x.status) ? 'ac' : x.status };
     byNorm[norm(e.title)] = e; byNum[e.num] = e; bySlug[e.slug] = e;
+  }
+  // A logged-in /api/problems/all/ response often still has user_name set while every status is
+  // null. The progress page lists solves through userProgressQuestionList (questionStatus SOLVED).
+  if (j.user_name) {
+    try {
+      const tabId = await getLeetCodeTabId();
+      const solved = await runInTab(tabId, lcSolvedSlugsInPage, {});
+      if (solved && solved.ok && Array.isArray(solved.slugs)) {
+        for (const slug of solved.slugs) {
+          const e = bySlug[slug];
+          if (e) e.status = 'ac';
+        }
+      }
+    } catch (err) {
+      console.warn('[neetbridge] could not read LeetCode solved list', err);
+    }
   }
   lcIndexCache = { at: Date.now(), userName: j.user_name || '', numSolved: j.num_solved || 0, byNorm, byNum, bySlug };
   return lcIndexCache;
@@ -536,7 +558,8 @@ async function handleReverseItem(item) {
   // Tick the roadmap regardless of the judge result (the LeetCode verdict was Accepted).
   if (topic) {
     try {
-      const m = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_MARK', topic, link: `${slug}/` });
+      // Practice checkboxes compare this full URL, not the short "<slug>/" form.
+      const m = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_MARK', topic, link: `https://leetcode.com/problems/${slug}/` });
       parts.push(m && m.ok ? `ticked in ${topic}` : `tick failed: ${(m && m.error) || 'no response'}`);
     } catch (err) {
       parts.push(`tick failed: ${String((err && err.message) || err)}`);
@@ -807,6 +830,38 @@ function lcSnippetInPage(p) {
   })();
 }
 
+function lcSolvedSlugsInPage() {
+  return (async () => {
+    const m = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
+    const headers = { 'content-type': 'application/json', 'x-csrftoken': (m && m[1]) || '', referer: 'https://leetcode.com/progress/' };
+    const query = 'query userProgressQuestionList($filters: UserProgressQuestionListInput) { userProgressQuestionList(filters: $filters) { totalNum questions { titleSlug questionStatus } } }';
+    const slugs = [];
+    let skip = 0;
+    let total = Infinity;
+    try {
+      while (skip < total && slugs.length < 5000) {
+        const r = await fetch('https://leetcode.com/graphql', {
+          method: 'POST', credentials: 'include', headers,
+          body: JSON.stringify({ query, variables: { filters: { questionStatus: 'SOLVED', skip, limit: 100 } } }),
+        });
+        const j = await r.json();
+        const node = j && j.data && j.data.userProgressQuestionList;
+        if (!node || !Array.isArray(node.questions)) return { ok: false, error: 'no-progress' };
+        total = Number(node.totalNum) || 0;
+        if (!node.questions.length) break;
+        for (const q of node.questions) {
+          if (q && q.titleSlug) slugs.push(q.titleSlug);
+        }
+        skip += node.questions.length;
+        if (node.questions.length < 100) break;
+      }
+      return { ok: true, slugs, total };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  })();
+}
+
 function lcLastAcceptedInPage(p) {
   return (async () => {
     const m = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
@@ -815,16 +870,30 @@ function lcLastAcceptedInPage(p) {
       const r = await fetch('https://leetcode.com/graphql', { method: 'POST', credentials: 'include', headers, body: JSON.stringify({ query, variables }) });
       return r.json();
     };
+    const accepted = (x) => !!x && (String(x.statusDisplay || '').toLowerCase() === 'accepted' || Number(x.status) === 10);
+    const submissionsOf = (list) => (list && list.data && list.data.questionSubmissionList && list.data.questionSubmissionList.submissions) || [];
     try {
-      const list = await gql('query l($s: String!, $o: Int!, $n: Int!) { questionSubmissionList(questionSlug: $s, offset: $o, limit: $n) { submissions { id statusDisplay lang } } }',
-        { s: p.slug, o: 0, n: 20 });
-      const subs = (list && list.data && list.data.questionSubmissionList && list.data.questionSubmissionList.submissions) || [];
-      const acc = subs.find((x) => x.statusDisplay === 'Accepted');
+      // status: 10 is SubmissionStatus.AC, the filter the submissions panel uses now.
+      let list = await gql('query l($s: String!, $o: Int!, $n: Int!, $st: Int) { questionSubmissionList(questionSlug: $s, offset: $o, limit: $n, status: $st) { submissions { id statusDisplay status lang } } }',
+        { s: p.slug, o: 0, n: 20, st: 10 });
+      let subs = submissionsOf(list);
+      let acc = subs.find(accepted);
+      if (!acc) {
+        list = await gql('query l($s: String!, $o: Int!, $n: Int!) { questionSubmissionList(questionSlug: $s, offset: $o, limit: $n) { submissions { id statusDisplay status lang } } }',
+          { s: p.slug, o: 0, n: 20 });
+        subs = submissionsOf(list);
+        acc = subs.find(accepted);
+      }
       if (!acc) return { ok: false, error: 'no accepted submission' };
-      const det = await gql('query d($id: Int!) { submissionDetails(submissionId: $id) { code lang { name } } }', { id: Number(acc.id) });
-      const d = det && det.data && det.data.submissionDetails;
+      // submissionId (Int) still parses, but the site now loads code through submissionIdV2 (ID).
+      let det = await gql('query d($id: ID!) { submissionDetails(submissionIdV2: $id) { code lang { name } } }', { id: String(acc.id) });
+      let d = det && det.data && det.data.submissionDetails;
+      if (!d || !d.code) {
+        det = await gql('query d($id: Int!) { submissionDetails(submissionId: $id) { code lang { name } } }', { id: Number(acc.id) });
+        d = det && det.data && det.data.submissionDetails;
+      }
       if (!d || !d.code) return { ok: false, error: 'no code' };
-      return { ok: true, code: d.code, lang: (d.lang && d.lang.name) || acc.lang, submissionId: acc.id };
+      return { ok: true, code: d.code, lang: acc.lang || (d.lang && d.lang.name), submissionId: acc.id };
     } catch (e) {
       return { ok: false, error: String(e) };
     }
@@ -844,9 +913,10 @@ function lcCheckInPage(p) {
         if (r.status === 403) return { done: true, ok: false, error: 'not-logged-in' };
         const j = await r.json();
         if (j.state === 'SUCCESS') {
+          const byCode = { 10: 'Accepted', 11: 'Wrong Answer', 12: 'Memory Limit Exceeded', 13: 'Output Limit Exceeded', 14: 'Time Limit Exceeded', 15: 'Runtime Error', 16: 'Internal Error', 20: 'Compile Error', 30: 'Timeout' };
           return {
             done: true, ok: true,
-            statusMsg: j.status_msg, statusCode: j.status_code, runtime: j.status_runtime, memory: j.status_memory,
+            statusMsg: j.status_msg || byCode[Number(j.status_code)] || 'Unknown', statusCode: j.status_code, runtime: j.status_runtime, memory: j.status_memory,
             totalCorrect: j.total_correct, totalTestcases: j.total_testcases, prettyLang: j.pretty_lang,
             compileError: j.full_compile_error || j.compile_error || null,
             runtimeError: j.full_runtime_error || j.runtime_error || null,
