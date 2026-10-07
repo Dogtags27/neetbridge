@@ -2,7 +2,7 @@
 //
 // Observes LeetCode's own submission traffic for the LeetCode -> NeetCode direction:
 //   * POST /problems/<slug>/submit/            body {lang, question_id, typed_code} -> {submission_id}
-//   * GET  /submissions/detail/<id>/check/     -> {state: "SUCCESS", status_code: 10, status_msg?: "Accepted", ...}
+//   * GET  /submissions/detail/<id>/check/     -> {state: "SUCCESS", status_msg: "Accepted", ...}
 // When a submission reaches a final verdict the code is handed to the content script.
 //
 // Only page-initiated requests are visible here. The submissions neetbridge itself sends into a
@@ -46,8 +46,6 @@
     if (id != null) pending.set(String(id), submission);
   };
 
-  const STATUS_TEXT = { 10: 'Accepted', 11: 'Wrong Answer', 12: 'Memory Limit Exceeded', 13: 'Output Limit Exceeded', 14: 'Time Limit Exceeded', 15: 'Runtime Error', 16: 'Internal Error', 20: 'Compile Error', 30: 'Timeout' };
-
   const onCheckResponse = (url, json) => {
     const m = CHECK_RE.exec(url);
     if (!m || !json || json.state !== 'SUCCESS') return;
@@ -58,7 +56,7 @@
       type: 'N2L_LC_SUBMISSION',
       ...submission,
       submissionId: m[1],
-      status: json.status_msg || STATUS_TEXT[Number(json.status_code)] || 'Unknown',
+      status: json.status_msg || 'Unknown',
       totalCorrect: json.total_correct,
       totalTestcases: json.total_testcases,
       at: Date.now(),

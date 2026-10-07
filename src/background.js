@@ -125,6 +125,29 @@ async function completedToIds(raw) {
   return { ids: [...ids], unknown: [...unknown] };
 }
 
+// The practice checkbox is on only for this exact URL. A leftover "<slug>/" does not count:
+// unticking removes the full URL and leaves the short one in place.
+function lcRoadmapLink(slug) {
+  return `https://leetcode.com/problems/${String(slug || '').replace(/^\/+|\/+$/g, '')}/`;
+}
+
+function roadmapTickedSlugs(raw) {
+  const strings = [];
+  const walk = (x, depth) => {
+    if (x == null || depth > 4) return;
+    if (typeof x === 'string') strings.push(x);
+    else if (Array.isArray(x)) x.forEach((v) => walk(v, depth + 1));
+    else if (typeof x === 'object') Object.values(x).forEach((v) => walk(v, depth + 1));
+  };
+  walk(raw, 0);
+  const slugs = new Set();
+  for (const s0 of strings) {
+    const m = /^https:\/\/leetcode\.com\/problems\/([^/?#]+)\/$/.exec(String(s0).trim());
+    if (m) slugs.add(m[1]);
+  }
+  return slugs;
+}
+
 // NeetCode language id <- LeetCode slug (for starter-code lookups)
 const LC2NC = Object.fromEntries(Object.entries(LANG_MAP).map(([nc, lc]) => [lc, nc]));
 
@@ -206,12 +229,6 @@ async function fetchLcAll() {
   return j;
 }
 
-// Legacy /api/problems/all/ uses "ac". The current problemset and progress APIs use "AC" / "SOLVED".
-function lcAcceptedStatus(status) {
-  const s = String(status == null ? '' : status).toLowerCase();
-  return s === 'ac' || s === 'solved';
-}
-
 async function getLcIndex(force = false) {
   if (!force && lcIndexCache && Date.now() - lcIndexCache.at < 10 * 60_000) return lcIndexCache;
   const j = await fetchLcAll();
@@ -219,24 +236,8 @@ async function getLcIndex(force = false) {
   for (const x of j.stat_status_pairs || []) {
     const s = x.stat;
     const e = { slug: s.question__title_slug, num: s.frontend_question_id, questionId: s.question_id,
-      premium: !!x.paid_only, title: s.question__title, status: lcAcceptedStatus(x.status) ? 'ac' : x.status };
+      premium: !!x.paid_only, title: s.question__title, status: x.status };
     byNorm[norm(e.title)] = e; byNum[e.num] = e; bySlug[e.slug] = e;
-  }
-  // A logged-in /api/problems/all/ response often still has user_name set while every status is
-  // null. The progress page lists solves through userProgressQuestionList (questionStatus SOLVED).
-  if (j.user_name) {
-    try {
-      const tabId = await getLeetCodeTabId();
-      const solved = await runInTab(tabId, lcSolvedSlugsInPage, {});
-      if (solved && solved.ok && Array.isArray(solved.slugs)) {
-        for (const slug of solved.slugs) {
-          const e = bySlug[slug];
-          if (e) e.status = 'ac';
-        }
-      }
-    } catch (err) {
-      console.warn('[neetbridge] could not read LeetCode solved list', err);
-    }
   }
   lcIndexCache = { at: Date.now(), userName: j.user_name || '', numSolved: j.num_solved || 0, byNorm, byNum, bySlug };
   return lcIndexCache;
@@ -339,7 +340,7 @@ async function enqueue(raw, source, { dryRun = false } = {}) {
 }
 
 // LeetCode -> NeetCode. `raw` = {slug, lang (LeetCode slug), code, ...}
-async function enqueueReverse(raw, source, { dryRun = false, level = null } = {}) {
+async function enqueueReverse(raw, source, { dryRun = false, level = null, retick = false } = {}) {
   const settings = await getSettings();
   const mode = level || settings.lc2nc;
   if (!mode || mode === 'off') return { reason: 'LeetCode -> NeetCode sync is off.', level: 'silent' };
@@ -357,7 +358,7 @@ async function enqueueReverse(raw, source, { dryRun = false, level = null } = {}
 
   const key = `lc2nc|${map.problemId}|${ncLang || 'mark'}|${mode === 'submit' && ncLang ? hashCode(raw.code) : 'mark'}`;
   const { synced = {} } = await getLocal('synced');
-  if (!settings.resubmitIdentical && synced[key] && synced[key].status === 'Accepted') {
+  if (!retick && !settings.resubmitIdentical && synced[key] && synced[key].status === 'Accepted') {
     return { reason: `${label}: already synced to NeetCode.`, level: 'info', duplicate: true };
   }
   if (dryRun) {
@@ -559,7 +560,7 @@ async function handleReverseItem(item) {
   if (topic) {
     try {
       // Practice checkboxes compare this full URL, not the short "<slug>/" form.
-      const m = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_MARK', topic, link: `https://leetcode.com/problems/${slug}/` });
+      const m = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_MARK', topic, link: lcRoadmapLink(slug) });
       parts.push(m && m.ok ? `ticked in ${topic}` : `tick failed: ${(m && m.error) || 'no response'}`);
     } catch (err) {
       parts.push(`tick failed: ${String((err && err.message) || err)}`);
@@ -641,12 +642,13 @@ async function startReverseBulk(options = {}) {
     const accepted = Object.values(idx.bySlug).filter((e) => e.status === 'ac');
     await setLocal({ bulk: { ...(await getLocal('bulk')).bulk, phase: 'collecting', updatedAt: Date.now(), total: accepted.length } });
 
-    // what is already ticked on NeetCode
-    let done = new Set();
+    // Already ticked means the practice checkbox URL is stored. A short "<slug>/" left
+    // behind after an untick does not light that checkbox, so it must be ticked again.
+    let ticked = new Set();
     try {
       const tabId = await getNeetCodeTabId();
       const c = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_COMPLETED' });
-      if (c && c.ok) done = new Set((await completedToIds(c.raw)).ids);
+      if (c && c.ok) ticked = roadmapTickedSlugs(c.raw);
     } catch (err) {
       console.warn('[neetbridge] could not read NeetCode progress', err);
     }
@@ -659,7 +661,7 @@ async function startReverseBulk(options = {}) {
       if (reverseAbort) break;
       n += 1;
       const map = await resolveByLeetCodeSlug(e.slug);
-      if (!map || done.has(map.problemId)) continue;
+      if (!map || ticked.has(map.slug)) continue;
       found += 1;
       let code = null;
       let lang = 'python3';
@@ -673,7 +675,7 @@ async function startReverseBulk(options = {}) {
         }
       }
       await enqueueReverse({ slug: e.slug, lang, code: code || '# accepted on LeetCode', at: Date.now() }, 'bulk',
-        { dryRun: !!options.dryRun, level: code ? 'submit' : 'mark' });
+        { dryRun: !!options.dryRun, level: code ? 'submit' : 'mark', retick: true });
       const { bulk = {} } = await getLocal('bulk');
       await setLocal({ bulk: { ...bulk, done: n, found, queued: found, updatedAt: Date.now() } });
     }
@@ -830,38 +832,6 @@ function lcSnippetInPage(p) {
   })();
 }
 
-function lcSolvedSlugsInPage() {
-  return (async () => {
-    const m = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
-    const headers = { 'content-type': 'application/json', 'x-csrftoken': (m && m[1]) || '', referer: 'https://leetcode.com/progress/' };
-    const query = 'query userProgressQuestionList($filters: UserProgressQuestionListInput) { userProgressQuestionList(filters: $filters) { totalNum questions { titleSlug questionStatus } } }';
-    const slugs = [];
-    let skip = 0;
-    let total = Infinity;
-    try {
-      while (skip < total && slugs.length < 5000) {
-        const r = await fetch('https://leetcode.com/graphql', {
-          method: 'POST', credentials: 'include', headers,
-          body: JSON.stringify({ query, variables: { filters: { questionStatus: 'SOLVED', skip, limit: 100 } } }),
-        });
-        const j = await r.json();
-        const node = j && j.data && j.data.userProgressQuestionList;
-        if (!node || !Array.isArray(node.questions)) return { ok: false, error: 'no-progress' };
-        total = Number(node.totalNum) || 0;
-        if (!node.questions.length) break;
-        for (const q of node.questions) {
-          if (q && q.titleSlug) slugs.push(q.titleSlug);
-        }
-        skip += node.questions.length;
-        if (node.questions.length < 100) break;
-      }
-      return { ok: true, slugs, total };
-    } catch (e) {
-      return { ok: false, error: String(e) };
-    }
-  })();
-}
-
 function lcLastAcceptedInPage(p) {
   return (async () => {
     const m = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
@@ -870,30 +840,16 @@ function lcLastAcceptedInPage(p) {
       const r = await fetch('https://leetcode.com/graphql', { method: 'POST', credentials: 'include', headers, body: JSON.stringify({ query, variables }) });
       return r.json();
     };
-    const accepted = (x) => !!x && (String(x.statusDisplay || '').toLowerCase() === 'accepted' || Number(x.status) === 10);
-    const submissionsOf = (list) => (list && list.data && list.data.questionSubmissionList && list.data.questionSubmissionList.submissions) || [];
     try {
-      // status: 10 is SubmissionStatus.AC, the filter the submissions panel uses now.
-      let list = await gql('query l($s: String!, $o: Int!, $n: Int!, $st: Int) { questionSubmissionList(questionSlug: $s, offset: $o, limit: $n, status: $st) { submissions { id statusDisplay status lang } } }',
-        { s: p.slug, o: 0, n: 20, st: 10 });
-      let subs = submissionsOf(list);
-      let acc = subs.find(accepted);
-      if (!acc) {
-        list = await gql('query l($s: String!, $o: Int!, $n: Int!) { questionSubmissionList(questionSlug: $s, offset: $o, limit: $n) { submissions { id statusDisplay status lang } } }',
-          { s: p.slug, o: 0, n: 20 });
-        subs = submissionsOf(list);
-        acc = subs.find(accepted);
-      }
+      const list = await gql('query l($s: String!, $o: Int!, $n: Int!) { questionSubmissionList(questionSlug: $s, offset: $o, limit: $n) { submissions { id statusDisplay lang } } }',
+        { s: p.slug, o: 0, n: 20 });
+      const subs = (list && list.data && list.data.questionSubmissionList && list.data.questionSubmissionList.submissions) || [];
+      const acc = subs.find((x) => x.statusDisplay === 'Accepted');
       if (!acc) return { ok: false, error: 'no accepted submission' };
-      // submissionId (Int) still parses, but the site now loads code through submissionIdV2 (ID).
-      let det = await gql('query d($id: ID!) { submissionDetails(submissionIdV2: $id) { code lang { name } } }', { id: String(acc.id) });
-      let d = det && det.data && det.data.submissionDetails;
-      if (!d || !d.code) {
-        det = await gql('query d($id: Int!) { submissionDetails(submissionId: $id) { code lang { name } } }', { id: Number(acc.id) });
-        d = det && det.data && det.data.submissionDetails;
-      }
+      const det = await gql('query d($id: Int!) { submissionDetails(submissionId: $id) { code lang { name } } }', { id: Number(acc.id) });
+      const d = det && det.data && det.data.submissionDetails;
       if (!d || !d.code) return { ok: false, error: 'no code' };
-      return { ok: true, code: d.code, lang: acc.lang || (d.lang && d.lang.name), submissionId: acc.id };
+      return { ok: true, code: d.code, lang: (d.lang && d.lang.name) || acc.lang, submissionId: acc.id };
     } catch (e) {
       return { ok: false, error: String(e) };
     }
@@ -913,10 +869,9 @@ function lcCheckInPage(p) {
         if (r.status === 403) return { done: true, ok: false, error: 'not-logged-in' };
         const j = await r.json();
         if (j.state === 'SUCCESS') {
-          const byCode = { 10: 'Accepted', 11: 'Wrong Answer', 12: 'Memory Limit Exceeded', 13: 'Output Limit Exceeded', 14: 'Time Limit Exceeded', 15: 'Runtime Error', 16: 'Internal Error', 20: 'Compile Error', 30: 'Timeout' };
           return {
             done: true, ok: true,
-            statusMsg: j.status_msg || byCode[Number(j.status_code)] || 'Unknown', statusCode: j.status_code, runtime: j.status_runtime, memory: j.status_memory,
+            statusMsg: j.status_msg, statusCode: j.status_code, runtime: j.status_runtime, memory: j.status_memory,
             totalCorrect: j.total_correct, totalTestcases: j.total_testcases, prettyLang: j.pretty_lang,
             compileError: j.full_compile_error || j.compile_error || null,
             runtimeError: j.full_runtime_error || j.runtime_error || null,
